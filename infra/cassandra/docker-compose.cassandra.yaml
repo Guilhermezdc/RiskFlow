@@ -1,12 +1,33 @@
+
 services:
   cassandra:
-    image: cassandra:latest
+    image: cassandra:4.1
     container_name: cassandra
     ports:
       - "9042:9042"
     environment:
-      CASSANDRA_CLUSTER_NAME: "MyCassandraCluster"
+      CASSANDRA_CLUSTER_NAME: "riskflow"
       CASSANDRA_NUM_TOKENS: 256
       CASSANDRA_START_RPC: "true"
+
+      CASSANDRA_AUTHENTICATOR: PasswordAuthenticator
+      CASSANDRA_AUTHORIZER: CassandraAuthorizer
+      CASSANDRA_ROLE_MANAGER: CassandraRoleManager
+
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -u cassandra -p cassandra -e 'describe keyspaces' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
     networks:
       - cassandra
+
+volumes:
+  cassandra_data:
+
+networks:
+  cassandra:

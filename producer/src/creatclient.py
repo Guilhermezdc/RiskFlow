@@ -1,11 +1,9 @@
-from cassandra.cluster import Cluster
-from cassandra.auth import PlainTextAuthProvider
 from dotenv import load_dotenv
 import os
 from faker import Faker
+from infra.cassandra.dbConnection import CassandraConnection
 
 env = load_dotenv(".env")
-
 
 class CreateUserClient:
     
@@ -34,7 +32,7 @@ class CreateUserClient:
         return self
 
     def save_to_cassandra(self):
-        with _CassandraConnection() as cassandra_conn:
+        with CassandraConnection() as cassandra_conn:
             insert_query = """
                 INSERT INTO users (user_id, name, email, city, state, country, ip_address, device)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -50,47 +48,3 @@ class CreateUserClient:
                 self.device
             )
             cassandra_conn.execute_query(insert_query, parameters)
-
-class _CassandraConnection:
-
-    """
-    This class manages the connection to a Cassandra database using environment variables for configuration.
-    It uses the context manager protocol to ensure that the connection is properly opened and closed.
-    """
-
-    def __init__(self):
-        self._username = os.getenv("CASSANDRA_USER", "root")
-        self._password = os.getenv("CASSANDRA_PASSWORD", "example_password")
-        self._host = os.getenv("CASSANDRA_HOST", "cassandra")
-        self._port = int(os.getenv("CASSANDRA_PORT", 9042))
-        self._keyspace = os.getenv("CASSANDRA_KEYSPACE", "riskflow")
-
-        self.cluster = None
-        self.session = None
-
-    def __enter__(self):
-        auth_provider = PlainTextAuthProvider(
-            username=self._username,
-            password=self._password
-        )
-
-        self.cluster = Cluster(
-            contact_points=[self._host],
-            port=self._port,
-            auth_provider=auth_provider
-        )
-
-        self.session = self.cluster.connect(self._keyspace)
-        return self
-
-    def execute_query(self, query, parameters=None):
-        if not self.session:
-            raise RuntimeError("Cassandra session is not initialized")
-
-        if parameters:
-            return self.session.execute(query, parameters)
-        return self.session.execute(query)
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.cluster:
-            self.cluster.shutdown()
