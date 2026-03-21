@@ -1,0 +1,313 @@
+version: "3.9"
+
+# ============================================================
+# Risk Flow — Docker Compose (Infraestrutura Local)
+# ============================================================
+# Uso:
+#   docker compose up -d
+#   docker compose down -v   (destrói volumes)
+# ============================================================
+
+networks:
+  risk-flow:
+    driver: bridge
+
+volumes:
+  kafka-data:
+  zookeeper-data:
+  redis-data:
+  cassandra-data:
+  spark-data:
+  localstack-data:
+
+# ──────────────────────────────────────────────
+# Kafka + Zookeeper
+# ──────────────────────────────────────────────
+services:
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: rf-zookeeper
+    networks: [risk-flow]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: rf-kafka
+    networks: [risk-flow]
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"       # acesso externo (gerador de transações)
+      - "9101:9101"       # JMX
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: 12
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_JMX_PORT: 9101
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:29092"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: rf-kafka-setup
+    networks: [risk-flow]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: |
+      bash -c "
+        echo '⚙️ Criando tópicos Kafka...'
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 \
+          --topic transactions.raw --partitions 12 --replication-factor 1 \
+          --config retention.ms=604800000
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 \
+          --topic transactions.decisions --partitions 12 --replication-factor 1 \
+          --config retention.ms=604800000
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 \
+          --topic transactions.dlq --partitions 4 --replication-factor 1 \
+          --config retention.ms=2592000000
+        echo '✅ Tópicos criados:'
+        kafka-topics --list --bootstrap-server kafka:29092
+      "
+    restart: on-failure
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: rf-kafka-ui
+    networks: [risk-flow]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: risk-flow-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    profiles: [monitoring]
+
+# ──────────────────────────────────────────────
+# Redis (Hot Memory)
+# ──────────────────────────────────────────────
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: rf-redis
+    networks: [risk-flow]
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+        --maxmemory 512mb
+        --maxmemory-policy allkeys-lru
+        --save 60 1000
+        --loglevel warning
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis-insight:
+    image: redislabs/redisinsight:latest
+    container_name: rf-redis-insight
+    networks: [risk-flow]
+    ports:
+      - "5540:5540"
+    profiles: [monitoring]
+
+# ──────────────────────────────────────────────
+# Cassandra (Warm Memory)
+# ──────────────────────────────────────────────
+
+  cassandra:
+    image: cassandra:4.1
+    container_name: rf-cassandra
+    networks: [risk-flow]
+    ports:
+      - "9042:9042"
+    environment:
+      CASSANDRA_CLUSTER_NAME: risk-flow
+      CASSANDRA_DC: datacenter1
+      CASSANDRA_RACK: rack1
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 128M
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+      - ./cassandra/schema.cql:/docker-entrypoint-initdb.d/schema.cql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'SELECT now() FROM system.local' || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 60s
+
+  cassandra-setup:
+    image: cassandra:4.1
+    container_name: rf-cassandra-setup
+    networks: [risk-flow]
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    command: |
+      bash -c "
+        echo '⚙️ Inicializando schema Cassandra...'
+        cqlsh cassandra 9042 -f /schema/schema.cql
+        echo '✅ Schema Cassandra inicializado'
+      "
+    volumes:
+      - ../../fraud-engine/cassandra/schema.cql:/schema/schema.cql:ro
+    restart: on-failure
+
+# ──────────────────────────────────────────────
+# Apache Flink
+# ──────────────────────────────────────────────
+
+  flink-jobmanager:
+    image: flink:1.18-scala_2.12-java11
+    container_name: rf-flink-jobmanager
+    networks: [risk-flow]
+    ports:
+      - "8081:8081"      # Flink Web UI
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 4
+        state.backend: filesystem
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        execution.checkpointing.interval: 30s
+    volumes:
+      - ./flink/checkpoints:/opt/flink/checkpoints
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/overview"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  flink-taskmanager:
+    image: flink:1.18-scala_2.12-java11
+    container_name: rf-flink-taskmanager
+    networks: [risk-flow]
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 1728m
+    scale: 2   # 2 task managers para paralelismo
+
+# ──────────────────────────────────────────────
+# Apache Spark
+# ──────────────────────────────────────────────
+
+  spark-master:
+    image: bitnami/spark:3.5
+    container_name: rf-spark-master
+    networks: [risk-flow]
+    ports:
+      - "7077:7077"      # Spark master
+      - "4040:4040"      # Spark Web UI
+      - "8082:8080"      # Spark master UI
+    environment:
+      SPARK_MODE: master
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+    volumes:
+      - spark-data:/opt/bitnami/spark/work
+
+  spark-worker:
+    image: bitnami/spark:3.5
+    container_name: rf-spark-worker
+    networks: [risk-flow]
+    depends_on: [spark-master]
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 2G
+      SPARK_WORKER_CORES: 2
+    scale: 2
+
+# ──────────────────────────────────────────────
+# LocalStack (emula AWS S3 + SNS localmente)
+# ──────────────────────────────────────────────
+
+  localstack:
+    image: localstack/localstack:3.0
+    container_name: rf-localstack
+    networks: [risk-flow]
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3,sns,sqs
+      DEFAULT_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      DATA_DIR: /var/lib/localstack
+    volumes:
+      - localstack-data:/var/lib/localstack
+      - ./localstack/init-aws.sh:/etc/localstack/init/ready.d/init-aws.sh:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+# ──────────────────────────────────────────────
+# Monitoring (perfil separado)
+# ──────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: rf-prometheus
+    networks: [risk-flow]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    profiles: [monitoring]
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: rf-grafana
+    networks: [risk-flow]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+    profiles: [monitoring]
+    depends_on: [prometheus]

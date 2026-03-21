@@ -1,0 +1,4 @@
+# transaction-generator/requirements.txt
+confluent-kafka==2.3.0
+python-dotenv==1.0.0
+faker==20.1.0
